@@ -4,6 +4,8 @@
 
 A preprocessing layer that reduces vision API costs by intelligently optimizing images based on what the user is actually trying to do. The insight: most vision API calls send way more visual data than the task requires.
 
+**Hackathon Project** — Token Company Track. Goal: demonstrate significant token savings while maintaining model output quality.
+
 ---
 
 ## Core Insight
@@ -12,196 +14,214 @@ GPT-4o charges for images based on resolution and detail level:
 - **Low detail mode**: Fixed 85 tokens, regardless of image size
 - **High detail mode**: Scales with image dimensions (170 tokens per 512x512 tile + 85 base)
 
-A 2048x4096 image costs ~1,105 tokens. But if someone just wants to know "is there text in this image?" — that's a binary question that could be answered with 85 tokens in low detail mode. That's 92% savings for the same answer quality.
+A 2048x4096 image costs ~1,105 tokens. But if someone just wants to know "is there text in this image?" — that's a binary question that could be answered with 85 tokens in low detail mode. That's **92% savings** for the same answer quality.
 
 The key is knowing *what the user wants* so we can optimize appropriately.
 
 ---
 
-## The Pipeline
+## Architecture (Finalized)
 
 ```
 User Query + Image
        ↓
-Intent Classification (CRITICAL - this determines everything)
+┌─────────────────────────────────────┐
+│  CLIP-based Intent + Image Analysis │  ← Runs locally, ZERO API cost
+│  - Query embedding                  │
+│  - Image embedding                  │
+│  - Intent classification            │
+│  - Image content understanding      │
+└─────────────────────────────────────┘
        ↓
-Strategy Selection (based on intent)
+Strategy Selection (lookup table)
        ↓
-Image Optimization (resize, crop, grayscale, quality, detail mode)
+Image Processor (Pillow)
        ↓
-Vision API Call
+Token Calculator (before/after)
+       ↓
+[Optional] Token Company API (compress text prompt)
+       ↓
+Vision API (GPT-4o) with optimized image
        ↓
 Response + Savings Report
 ```
 
+**Key Design Decision**: No LLM in the preprocessing pipeline. Using an LLM to classify intent would defeat the purpose (spending tokens to save tokens). CLIP runs locally with zero API cost.
+
 ---
 
-## Intent Classification (The Hard Part)
+## Why CLIP
 
-This is the most crucial component. If we misclassify intent, we either:
-- Over-compress and lose information the model needed
-- Under-compress and waste tokens
+CLIP (Contrastive Language-Image Pre-training) is perfect for this use case:
 
-### What the classifier needs to understand:
+1. **Encodes text and images into the same embedding space** — we can compare query intent to canonical examples
+2. **Runs locally** — no API calls, no token costs
+3. **Fast inference** — ~50-100ms
+4. **Understands both query AND image content** — enables smarter optimization decisions
 
-**Text Extraction Tasks**
-- User wants to read/extract/transcribe text from the image
-- Needs: High resolution in text regions, but color often irrelevant
-- Signals: "extract", "read", "OCR", "transcribe", "what does it say", "receipt", "document"
+Model: `openai/clip-vit-base-patch32` (fast, good enough for demo)
 
-**Scene Description Tasks**
-- User wants a general understanding of what's in the image
-- Needs: Moderate resolution, color matters, full image context
-- Signals: "describe", "what's in this", "tell me about", "explain this image"
+---
 
-**Object Detection / Localization**
-- User wants to find or count specific things
-- Needs: Enough resolution to identify objects, but not fine detail
-- Signals: "find", "locate", "is there a", "count", "how many", "detect"
+## Intent Classification
 
-**Binary Questions**
-- User wants a yes/no or simple categorical answer
-- Needs: Minimal detail — the model just needs to recognize presence/absence
-- Signals: "is this a", "does it have", "yes or no", "true or false", "is there"
+### Intent Categories
 
-**Detailed Analysis**
-- User wants deep examination (charts, diagrams, technical content)
-- Needs: Maximum preservation — don't compress much
-- Signals: "analyze", "chart", "graph", "diagram", "detailed", "explain the data"
+| Intent | Description | Optimization Strategy |
+|--------|-------------|----------------------|
+| `BINARY_QUESTION` | Yes/no questions about image content | Maximum compression, low detail mode (85 tokens) |
+| `TEXT_EXTRACTION` | OCR, reading text from images | High res in text regions, grayscale OK |
+| `SCENE_DESCRIPTION` | General "what's in this image" queries | Moderate compression, keep color |
+| `OBJECT_DETECTION` | Finding/counting specific things | Can compress, need object visibility |
+| `DETAILED_ANALYSIS` | Charts, graphs, technical content | Minimal compression, preserve everything |
+| `COMPARISON` | Comparing multiple images | Consistent processing across images |
 
-**Comparison Tasks**
-- User wants to compare multiple images or regions
-- Needs: Consistent processing across images
-- Signals: "difference", "compare", "which one", "same or different"
+### How CLIP Classification Works
 
-### The classifier should output:
-1. **Intent category** — which type of task
-2. **Confidence score** — how sure are we
-3. **Key entities** — what specifically is the user looking for (if applicable)
+1. Pre-compute embeddings for canonical descriptions of each intent
+2. Embed the user's query
+3. Calculate cosine similarity between query embedding and intent embeddings
+4. Return highest-scoring intent + confidence
+
+Example canonical descriptions:
+```python
+INTENT_DESCRIPTIONS = {
+    "BINARY_QUESTION": "Answer yes or no. Is there something in the image? Does it contain something?",
+    "TEXT_EXTRACTION": "Read the text. Extract words. OCR. Transcribe. What does it say?",
+    "SCENE_DESCRIPTION": "Describe this image. What is in this picture? Tell me about this.",
+    ...
+}
+```
 
 ---
 
 ## Optimization Strategies
 
-Each intent maps to a strategy. The strategy defines:
-
-| Parameter | What it controls |
-|-----------|------------------|
-| Max dimension | Largest width/height allowed |
-| Target shortest side | For aspect-ratio-aware scaling |
-| Grayscale | Whether to strip color |
-| Compression quality | JPEG quality level |
-| Detail mode | "low" (85 tokens flat) vs "high" (tile-based) |
-| Crop behavior | Whether to attempt smart cropping |
-
-### Strategy logic by intent:
-
-**Text Extraction**
-- Keep resolution high enough for text legibility
-- Grayscale is usually fine (text is text)
-- Could crop to text regions if we detect them
-- High detail mode (need the resolution)
-
-**Scene Description**
-- Moderate compression acceptable
-- Keep color (matters for description)
-- No cropping (need full context)
-- High detail mode
-
-**Object Detection**
-- Can compress more aggressively
-- Color optional depending on query
-- No cropping
-- High detail mode (but smaller image)
-
-**Binary Questions**
-- Maximum compression
-- Grayscale often fine
-- Low detail mode — this is where huge savings come from
-- 85 tokens regardless of original size
-
-**Detailed Analysis**
-- Minimal compression
-- Preserve everything
-- High detail mode
-- No aggressive optimizations
+```python
+STRATEGIES = {
+    "BINARY_QUESTION": {
+        "detail_mode": "low",      # 85 tokens flat
+        "max_dimension": 512,
+        "grayscale": True,
+        "jpeg_quality": 60,
+    },
+    "TEXT_EXTRACTION": {
+        "detail_mode": "high",
+        "max_dimension": 2048,
+        "grayscale": True,
+        "jpeg_quality": 85,
+    },
+    "SCENE_DESCRIPTION": {
+        "detail_mode": "high",
+        "max_dimension": 1024,
+        "grayscale": False,
+        "jpeg_quality": 75,
+    },
+    "DETAILED_ANALYSIS": {
+        "detail_mode": "high",
+        "max_dimension": 2048,
+        "grayscale": False,
+        "jpeg_quality": 90,
+    },
+}
+```
 
 ---
 
-## GPT-4o Token Math
+## Token Calculation (GPT-4o)
 
-### Low Detail
-Always 85 tokens. Period.
+### Low Detail Mode
+Always **85 tokens**. Period.
 
-### High Detail
-1. If image exceeds 2048px on any side, scale down to fit in 2048x2048 (preserve aspect ratio)
-2. Scale so the shortest side is 768px
-3. Count how many 512x512 tiles cover the image
-4. Total = (tile_count × 170) + 85
+### High Detail Mode
+1. Scale image to fit within 2048x2048 (preserve aspect ratio)
+2. Scale so shortest side is 768px
+3. Count 512x512 tiles
+4. Total = `(tile_count × 170) + 85`
 
-### Examples
-- 1024x1024 → scales to 768x768 → 4 tiles → 765 tokens
-- 2048x4096 → scales to 1024x2048 → then 768x1536 → 6 tiles → 1105 tokens
-- Any image in low detail → 85 tokens
+```python
+def calculate_tokens(width, height, detail="high"):
+    if detail == "low":
+        return 85
+
+    # Scale to fit 2048x2048
+    if max(width, height) > 2048:
+        scale = 2048 / max(width, height)
+        width, height = int(width * scale), int(height * scale)
+
+    # Scale shortest side to 768
+    scale = 768 / min(width, height)
+    width, height = int(width * scale), int(height * scale)
+
+    # Count tiles
+    tiles_x = math.ceil(width / 512)
+    tiles_y = math.ceil(height / 512)
+
+    return 85 + (170 * tiles_x * tiles_y)
+```
 
 ---
 
-## The Token Company Integration
+## Tech Stack
+
+| Component | Tool |
+|-----------|------|
+| Intent Classification | CLIP (`openai/clip-vit-base-patch32`) |
+| Image Processing | Pillow |
+| Token Calculation | Custom (OpenAI formula) |
+| Text Compression | Token Company API (`bear-1`) |
+| Backend | FastAPI |
+| Frontend | Streamlit |
+
+---
+
+## Token Company Integration
 
 Their API compresses text prompts. We compress images. Together = full multimodal compression.
 
-**Their API:**
-- Endpoint: `POST https://api.thetokencompany.com/v1/compress`
-- Model: `bear-1`
-- Key parameter: `aggressiveness` (0.0-1.0)
-  - 0.1-0.3: Light compression
-  - 0.4-0.6: Moderate
-  - 0.7-0.9: Aggressive
-
-**Integration story:**
-1. Compress the text prompt with their API
-2. Compress the image with our pipeline
-3. Send both to vision model
-4. Report combined savings
+**Endpoint**: `POST https://api.thetokencompany.com/v1/compress`
+**Model**: `bear-1`
+**Key parameter**: `aggressiveness` (0.0-1.0)
 
 ---
 
-## Demo Requirements
+## Demo Flow (For Judges)
 
-The demo needs to make savings visceral and undeniable:
+1. **Show the problem**: Large image + simple question = wasted tokens
+2. **Show the solution**: Intent detection → smart compression → massive savings
+3. **Show the math**: At scale, this saves $X/month
+4. **Let them try**: Interactive demo with their own images
 
-1. **Visual comparison** — show original vs optimized image
-2. **Token counter** — real numbers, not estimates
-3. **Cost projection** — "at 10K images/day, you'd save $X/month"
-4. **Intent transparency** — show what intent was detected and why
-5. **Multiple scenarios** — different query types showing different optimization paths
+---
+
+## File Structure
+
+```
+semantic_image_optimizer/
+├── backend/
+│   ├── main.py              # FastAPI app
+│   ├── optimizer/
+│   │   ├── __init__.py
+│   │   ├── intent.py        # CLIP-based intent classification ✅ DONE
+│   │   ├── strategies.py    # Compression strategies per intent
+│   │   └── processor.py     # Pillow image operations
+│   ├── api/
+│   │   └── vision.py        # GPT-4o wrapper + token counting
+│   └── tokens.py            # Token calculation helpers
+├── frontend/
+│   └── app.py               # Streamlit app
+├── tests/
+│   └── sample_images/       # Test images
+├── test_intent.py           # Test script for intent classifier ✅ DONE
+├── requirements.txt         # ✅ DONE
+└── README.md
+```
 
 ---
 
 ## Success Metrics
 
-- Token reduction: 40-70% average across mixed workloads
-- Accuracy preservation: Optimized responses should match unoptimized responses
-- Latency: Preprocessing should add minimal overhead
-- Demo clarity: Judges should immediately understand the value prop
-
----
-
-## What We're NOT Building
-
-- A replacement for vision models
-- A general image compression tool
-- Anything that requires training custom models
-- A dashboard or analytics platform
-
-We're building a smart preprocessing layer. That's it.
-
----
-
-## Open Questions to Decide
-
-1. What framework for the UI?
-2. Zero-shot classifier vs keyword matching vs hybrid?
-3. How to handle low-confidence intent classifications?
-4. Should we support batch processing?
-5. How aggressive should default compression be?
+- **Token reduction**: 40-70% average across mixed workloads
+- **Accuracy preservation**: Optimized responses match unoptimized responses
+- **Demo clarity**: Judges immediately understand the value prop
+- **Wow factor**: The savings numbers should be impressive
