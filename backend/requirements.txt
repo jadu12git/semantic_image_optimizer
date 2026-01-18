@@ -1,5 +1,4 @@
-# TokenSqueeze Backend Dependencies
-# For Railway/Render deployment
+# TokenSqueeze Backend Dependencies (Full version with PyTorch CPU)
 
 # API Framework
 fastapi>=0.109.0
@@ -12,7 +11,7 @@ Pillow>=10.0.0
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
 
-# ML - Intent Classification
+# ML - Intent Classification (DeBERTa zero-shot)
 torch>=2.0.0
 transformers>=4.35.0
 
