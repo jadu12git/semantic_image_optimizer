@@ -1,0 +1,20 @@
+# TokenSqueeze Backend Dependencies
+# For Railway/Render deployment
+
+# API Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+python-dotenv>=1.0.0
+
+# Image Processing
+Pillow>=10.0.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+
+# ML - Intent Classification
+torch>=2.0.0
+transformers>=4.35.0
+
+# HTTP Client
+requests>=2.31.0
