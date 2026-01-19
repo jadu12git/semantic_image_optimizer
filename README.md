@@ -1,4 +1,4 @@
-semantic_image_optimizer
+TokenSqueeze
 optimize image input for LLMs to save on tokens but maintain performance
 file structure
 token-squeeze/
